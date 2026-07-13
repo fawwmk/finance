@@ -1,0 +1,62 @@
+{
+  "_comment": "Актуальные налоговые ставки. Приложение скачивает этот файл при запуске и накладывает поверх вшитых значений — поэтому обновить ставки можно, просто поправив этот файл и нажав Sync в VS Code. Пересобирать приложение не нужно.",
+  "_howToUpdate": "1) Проверь цифры на nalog.gov.ru. 2) Поправь здесь. 3) Обнови updatedAt и source. 4) Sync в VS Code. Приложение подхватит в течение суток или сразу по кнопке «Обновить ставки» в Настройках.",
+
+  "version": 1,
+  "year": 2026,
+  "updatedAt": "2026-07-13",
+  "source": "nalog.gov.ru; ФЗ-425 от 28.11.2025; Постановление № 1705 от 31.10.2025; Распоряжение № 4125-р от 27.12.2025",
+
+  "npd": {
+    "rateIndividual": 0.04,
+    "rateCompany": 0.06,
+    "bonusTotal": 10000,
+    "incomeLimit": 2400000
+  },
+
+  "ipContributions": {
+    "fixed": 57390,
+    "extraRate": 0.01,
+    "extraThreshold": 300000,
+    "extraCap": 321818
+  },
+
+  "payroll": {
+    "baseRate": 0.3,
+    "aboveLimitRate": 0.151,
+    "limitBase": 2979000,
+    "msmeRate": 0.15,
+    "msmeThresholdMrots": 1.5,
+    "mrot": 27093
+  },
+
+  "voluntarySfr": {
+    "rate": 0.029
+  },
+
+  "usn": {
+    "incomeRate": 0.06,
+    "profitRate": 0.15,
+    "minTaxRate": 0.01,
+    "incomeLimit": 450000000,
+    "vatThreshold": 20000000,
+    "vatRateBase": 0.22,
+    "vatRateLow": 0.05,
+    "vatRateMid": 0.07
+  },
+
+  "psn": {
+    "rate": 0.06,
+    "incomeLimit": 20000000
+  },
+
+  "ndflBrackets": [
+    { "upTo": 2400000, "rate": 0.13 },
+    { "upTo": 5000000, "rate": 0.15 },
+    { "upTo": 20000000, "rate": 0.18 },
+    { "upTo": 50000000, "rate": 0.2 },
+    { "upTo": null, "rate": 0.22 }
+  ],
+
+  "ndflNonResident": 0.3
+}
