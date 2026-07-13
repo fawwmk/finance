@@ -44,8 +44,9 @@ export function TaxScreen({ navigation }: any) {
   const {
     taxProfile,
     taxSetAside,
+    taxPaid,
     setTaxAside,
-    resetTaxAside,
+    payTax,
     transactions,
     settings,
     rates,
@@ -79,7 +80,10 @@ export function TaxScreen({ navigation }: any) {
     () => taxYearExpenses(transactions, base, rates, year),
     [transactions, base, rates, year]
   );
-  const bonusUsed = useMemo(() => npdBonusUsed(transactions), [transactions]);
+  const bonusUsed = useMemo(
+    () => npdBonusUsed(transactions, base, rates),
+    [transactions, base, rates]
+  );
 
   /* ── Профиль ещё не настроен ── */
   if (!taxProfile) {
@@ -125,8 +129,17 @@ export function TaxScreen({ navigation }: any) {
   const activity = activityById(profile.activityId);
 
   const needed = burden.total;
-  const gap = Math.max(0, needed - taxSetAside);
-  const progress = needed > 0 ? Math.min(1, taxSetAside / needed) : 1;
+
+  /**
+   * Долг закрывается двумя способами: деньги лежат в копилке ИЛИ уже уплачены
+   * в бюджет. Считать надо и то, и другое.
+   *
+   * Раньше «уплачено» просто обнуляло копилку — и приложение снова требовало
+   * отложить налог с дохода, который уже оплачен.
+   */
+  const covered = taxSetAside + taxPaid;
+  const gap = Math.max(0, needed - covered);
+  const progress = needed > 0 ? Math.min(1, covered / needed) : 1;
 
   const isEmployee = profile.status === 'employee';
 
@@ -137,15 +150,28 @@ export function TaxScreen({ navigation }: any) {
     setTopUp('');
   };
 
-  const confirmPaid = () =>
+  /**
+   * Уплата в бюджет. Обычно платится аванс — часть годовой суммы, а не всё.
+   * Поэтому спрашиваем, сколько именно, и переносим ровно эту сумму
+   * из копилки в «уплачено», а не стираем всё.
+   */
+  const confirmPaid = () => {
+    if (taxSetAside <= 0) {
+      Alert.alert('Копилка пуста', 'Сначала отложи деньги на налог.');
+      return;
+    }
     Alert.alert(
-      'Налог уплачен?',
-      'Обнулю копилку — начнём копить заново с нуля.',
+      'Заплатил налог?',
+      `Перенесу деньги из копилки в «уплачено за ${year} год». Долг перед бюджетом уменьшится на эту же сумму — заново откладывать не придётся.`,
       [
         { text: 'Отмена', style: 'cancel' },
-        { text: 'Уплачено', onPress: resetTaxAside },
+        {
+          text: `Уплатил ${formatMoney(taxSetAside, base)}`,
+          onPress: () => payTax(taxSetAside),
+        },
       ]
     );
+  };
 
   /* ── Зарплата: откладывать нечего, показываем разбор ── */
   const monthIncome = monthTotals(transactions, base, rates).income;
@@ -316,6 +342,19 @@ export function TaxScreen({ navigation }: any) {
                   из {formatMoney(needed, base)}
                 </Txt>
               </View>
+
+              {taxPaid > 0 && (
+                <Txt variant="caption" color={palette.income} style={{ marginTop: 2 }}>
+                  Уже уплачено в бюджет за {year} год: {formatMoney(taxPaid, base)}
+                </Txt>
+              )}
+
+              {burden.vat > 0 && (
+                <Txt variant="caption" color={palette.warning} style={{ marginTop: 2 }}>
+                  Включая НДС {formatMoney(burden.vat, base)} — ты перешагнул порог{' '}
+                  {formatMoney(20_000_000, base)}.
+                </Txt>
+              )}
             </Card>
 
             {/* Пополнить копилку */}

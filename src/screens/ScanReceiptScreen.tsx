@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   View,
   ScrollView,
@@ -10,6 +10,7 @@ import {
   Pressable,
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
+import * as ImageManipulator from 'expo-image-manipulator';
 import { Ionicons } from '@expo/vector-icons';
 
 import { Screen, Card, Txt, Button, Touchable } from '../components/ui';
@@ -19,7 +20,7 @@ import { useStore } from '../store/useStore';
 import { categoryById } from '../data/categories';
 import { recognizeReceipt, guessCategory, OcrError, ParsedReceipt } from '../services/ocr';
 import { CurrencyCode } from '../types';
-import { formatMoney, todayISO } from '../utils/format';
+import { formatMoney, todayISO, plural } from '../utils/format';
 
 /** Позиция чека в состоянии редактирования. */
 interface DraftItem {
@@ -45,46 +46,98 @@ export function ScanReceiptScreen({ navigation }: any) {
 
   const expenseCats = categories.filter((c) => c.kind === 'expense');
 
+  /**
+   * Экран мог закрыться, пока чек распознавался (это до минуты).
+   * Тогда обновлять его состояние нельзя, и алерт показывать тоже — он выскочит
+   * поверх совсем другого экрана и напугает.
+   */
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
   /** Снять чек камерой или выбрать из галереи. */
   const pick = async (from: 'camera' | 'library') => {
-    const perm =
-      from === 'camera'
-        ? await ImagePicker.requestCameraPermissionsAsync()
-        : await ImagePicker.requestMediaLibraryPermissionsAsync();
-
-    if (!perm.granted) {
-      Alert.alert(
-        'Нет доступа',
+    // Ни одна из этих операций не обёрнута системой: камера может быть занята,
+    // в симуляторе её нет вовсе, доступ могут отозвать на ходу. Без try/catch
+    // кнопка просто молча переставала работать.
+    try {
+      const perm =
         from === 'camera'
-          ? 'Разреши приложению камеру в настройках iPhone.'
-          : 'Разреши доступ к фото в настройках iPhone.'
+          ? await ImagePicker.requestCameraPermissionsAsync()
+          : await ImagePicker.requestMediaLibraryPermissionsAsync();
+
+      if (!perm.granted) {
+        Alert.alert(
+          'Нет доступа',
+          from === 'camera'
+            ? 'Разреши приложению камеру в настройках iPhone.'
+            : 'Разреши доступ к фото в настройках iPhone.'
+        );
+        return;
+      }
+
+      const res =
+        from === 'camera'
+          ? await ImagePicker.launchCameraAsync({
+              mediaTypes: ['images'],
+              allowsEditing: true,
+              quality: 0.8,
+            })
+          : await ImagePicker.launchImageLibraryAsync({
+              mediaTypes: ['images'],
+              allowsEditing: true,
+              quality: 0.8,
+            });
+
+      if (res.canceled) return;
+
+      const asset = res.assets?.[0];
+      if (!asset?.uri) {
+        Alert.alert('Не получилось', 'Не удалось прочитать фото. Попробуй ещё раз.');
+        return;
+      }
+
+      setImageUri(asset.uri);
+      await recognize(asset.uri);
+    } catch {
+      Alert.alert(
+        'Камера недоступна',
+        'Не удалось открыть камеру или галерею. Попробуй ещё раз или выбери фото из галереи.'
       );
-      return;
     }
-
-    const options: ImagePicker.ImagePickerOptions = {
-      mediaTypes: ['images'],
-      allowsEditing: true,
-      quality: 0.6,
-      base64: true,
-    };
-
-    const res =
-      from === 'camera'
-        ? await ImagePicker.launchCameraAsync(options)
-        : await ImagePicker.launchImageLibraryAsync(options);
-
-    if (res.canceled || !res.assets?.[0]?.base64) return;
-
-    const asset = res.assets[0];
-    setImageUri(asset.uri);
-    await recognize(asset.base64!);
   };
 
-  const recognize = async (base64: string) => {
+  /**
+   * Сжимает фото перед отправкой.
+   *
+   * Снимок с iPhone — это 3–5 МБ, а в base64 он раздувается ещё на треть.
+   * Такую строку тяжело держать в памяти, она надолго вешает интерфейс при
+   * упаковке в запрос, а Anthropic картинки больше 5 МБ просто отклоняет —
+   * то есть нормальный чек, снятый целиком, не распознавался вообще никогда.
+   *
+   * 1600 пикселей по длинной стороне — текст чека читается уверенно,
+   * а размер падает примерно на порядок.
+   */
+  const toBase64 = async (uri: string): Promise<string> => {
+    const out = await ImageManipulator.manipulateAsync(uri, [{ resize: { width: 1600 } }], {
+      compress: 0.7,
+      format: ImageManipulator.SaveFormat.JPEG,
+      base64: true,
+    });
+    if (!out.base64) throw new OcrError('Не удалось подготовить фото к отправке.');
+    return out.base64;
+  };
+
+  const recognize = async (uri: string) => {
     setStage('working');
     try {
+      const base64 = await toBase64(uri);
       const result = await recognizeReceipt(base64, settings);
+      if (!alive.current) return;
 
       if (!result.items.length) {
         setStage('idle');
@@ -109,6 +162,7 @@ export function ScanReceiptScreen({ navigation }: any) {
       );
       setStage('review');
     } catch (e) {
+      if (!alive.current) return;
       setStage('idle');
       const msg =
         e instanceof OcrError
@@ -197,7 +251,22 @@ export function ScanReceiptScreen({ navigation }: any) {
                 операцией. Русский, английский, итальянский.
               </Txt>
 
-              <View style={{ width: '100%', marginTop: spacing.xxl, gap: spacing.md }}>
+              {/*
+                Честное предупреждение. Распознавание идёт не на телефоне:
+                фотография уходит в интернет. Человек имеет право знать это
+                ДО того, как нажмёт кнопку, а не найти мелким шрифтом в настройках.
+              */}
+              <Txt
+                variant="caption"
+                color={palette.textFaint}
+                style={{ marginTop: spacing.md, textAlign: 'center', paddingHorizontal: spacing.xl }}
+              >
+                Фото чека отправляется в сервис распознавания (
+                {(settings.ocrProvider ?? 'claude') === 'claude' ? 'Anthropic' : 'OCR.space'}) — на
+                телефоне такое не считается. Если на чеке есть лишнее, лучше обрежь кадр.
+              </Txt>
+
+              <View style={{ width: '100%', marginTop: spacing.xl, gap: spacing.md }}>
                 <Button title="📸  Снять камерой" onPress={() => pick('camera')} />
                 <Button
                   title="Выбрать из галереи"
@@ -317,7 +386,12 @@ export function ScanReceiptScreen({ navigation }: any) {
           </Txt>
         </View>
         <Button
-          title={`Внести ${included.length} ${plural(included.length)}`}
+          title={`Внести ${included.length} ${plural(
+            included.length,
+            'операцию',
+            'операции',
+            'операций'
+          )}`}
           onPress={save}
           disabled={!included.length}
         />
@@ -326,13 +400,6 @@ export function ScanReceiptScreen({ navigation }: any) {
   );
 }
 
-function plural(n: number) {
-  const m10 = n % 10;
-  const m100 = n % 100;
-  if (m10 === 1 && m100 !== 11) return 'операцию';
-  if (m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20)) return 'операции';
-  return 'операций';
-}
 
 function Header({ title, onClose }: { title: string; onClose: () => void }) {
   return (

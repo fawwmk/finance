@@ -14,6 +14,7 @@
  */
 
 import { CashMode, CurrencyCode, ExchangeRates } from '../types';
+import { fetchWithTimeout } from '../utils/http';
 
 const AIYL_URL = 'https://abank.kg/ky';
 
@@ -32,7 +33,19 @@ type Board = Partial<Record<Quoted, Quote>>;
 const ROW =
   /course__name">(USD|EUR|RUB|KZT)<\/span>\s*<\/td>\s*<td>([\d.]+)<\/td>\s*<td>([\d.]+)<\/td>/g;
 
-/** Достаёт из HTML две доски котировок: наличные и безнал. */
+/**
+ * Достаёт из HTML две доски котировок: наличные и безнал.
+ *
+ * ОСТОРОЖНО. У банка нет API, мы разбираем вёрстку сайта. Разметка держится
+ * на договорённости «первые четыре строки — наличные, следующие четыре —
+ * безнал». Если банк добавит строку, уберёт валюту или просто вставит
+ * неразрывный пробел в одну ячейку, окно съедет: курс безнала подставится
+ * как наличный. Молча. А курсы отличаются на 9%.
+ *
+ * Поэтому проверяем строго: ровно 8 строк, и в каждой четвёрке — ровно те
+ * четыре валюты, которые мы ждём, без повторов. Не сошлось — говорим «не
+ * распарсили» и откатываемся на ЦБ. Честный курс ЦБ лучше выдуманного банковского.
+ */
 export function parseAiylHtml(html: string): { cash: Board; card: Board } {
   const rows: { code: Quoted; buy: number; sell: number }[] = [];
 
@@ -42,16 +55,35 @@ export function parseAiylHtml(html: string): { cash: Board; card: Board } {
     rows.push({ code: m[1] as Quoted, buy: parseFloat(m[2]), sell: parseFloat(m[3]) });
   }
 
-  const toBoard = (slice: typeof rows): Board => {
+  if (rows.length !== QUOTED.length * 2) {
+    throw new Error(
+      `Айыл Банк: ожидали ${QUOTED.length * 2} строк курсов, нашли ${rows.length}. ` +
+        'Похоже, сайт переделали.'
+    );
+  }
+
+  const toBoard = (slice: typeof rows, label: string): Board => {
     const b: Board = {};
     for (const r of slice) {
-      if (r.buy > 0 && r.sell > 0) b[r.code] = { buy: r.buy, sell: r.sell };
+      if (!(r.buy > 0 && r.sell > 0)) {
+        throw new Error(`Айыл Банк: нечитаемый курс ${r.code} (${label}).`);
+      }
+      if (b[r.code]) throw new Error(`Айыл Банк: ${r.code} встретился дважды (${label}).`);
+      b[r.code] = { buy: r.buy, sell: r.sell };
+    }
+    // Все четыре валюты должны быть на месте — иначе окно строк съехало.
+    const missing = QUOTED.filter((c) => !b[c]);
+    if (missing.length) {
+      throw new Error(`Айыл Банк: в блоке «${label}» нет ${missing.join(', ')}.`);
     }
     return b;
   };
 
   // Первые четыре строки — наличные, следующие четыре — безнал.
-  return { cash: toBoard(rows.slice(0, 4)), card: toBoard(rows.slice(4, 8)) };
+  return {
+    cash: toBoard(rows.slice(0, 4), 'наличные'),
+    card: toBoard(rows.slice(4, 8), 'безнал'),
+  };
 }
 
 /** Сом относительно самого себя — всегда 1. */
@@ -81,6 +113,11 @@ export function boardToRates(
 ): ExchangeRates {
   const baseQ = quoteFor(board, base);
   if (!baseQ) throw new Error(`Айыл Банк не котирует ${base}`);
+  // На эти два числа мы делим. Ноль превратил бы курс в бесконечность,
+  // а бесконечность — в «Infinity ₽» на экране.
+  if (!(baseQ.buy > 0) || !(baseQ.sell > 0)) {
+    throw new Error(`Айыл Банк: нулевой курс ${base}`);
+  }
 
   const rates: Partial<Record<CurrencyCode, number>> = {};
   const buy: Partial<Record<CurrencyCode, number>> = {};
@@ -121,9 +158,13 @@ export async function fetchAiylRates(
   base: CurrencyCode,
   cashMode: CashMode
 ): Promise<ExchangeRates> {
-  const res = await fetch(AIYL_URL, {
-    headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'ru' },
-  });
+  const res = await fetchWithTimeout(
+    AIYL_URL,
+    { headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'ru' } },
+    // Держим короткий таймаут: это сайт без гарантий, и если он «думает»,
+    // нам важнее быстро откатиться на ЦБ, чем дождаться его ответа.
+    8_000
+  );
   if (!res.ok) throw new Error(`abank.kg ответил ${res.status}`);
 
   const html = await res.text();

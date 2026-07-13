@@ -401,12 +401,25 @@ export function SettingsScreen({ navigation }: any) {
             </Txt>
           </View>
         </Card>
+        {/*
+          Раньше здесь было написано «данные хранятся только на этом телефоне».
+          Это неправда: фото чеков уходят в сервис распознавания. Обещание
+          приватности, которое приложение не выполняет, — хуже, чем его отсутствие.
+        */}
         <Txt
           variant="caption"
           color={palette.textFaint}
           style={{ textAlign: 'center', marginTop: spacing.xl }}
         >
-          Финансы · версия 0.2 · данные хранятся только на этом телефоне
+          Финансы · версия 0.2
+        </Txt>
+        <Txt
+          variant="caption"
+          color={palette.textFaint}
+          style={{ textAlign: 'center', marginTop: 4, paddingHorizontal: spacing.lg }}
+        >
+          Операции, кредиты и налоги хранятся только на этом телефоне и никуда не отправляются.
+          Исключение — фото чеков: они уходят в сервис распознавания, иначе распознать их нельзя.
         </Txt>
       </ScrollView>
     </Screen>

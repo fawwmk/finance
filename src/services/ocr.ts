@@ -14,6 +14,7 @@
  */
 
 import { CurrencyCode, ReceiptItem, Settings } from '../types';
+import { fetchWithTimeout } from '../utils/http';
 
 /** Что удалось вытащить из чека. */
 export interface ParsedReceipt {
@@ -49,6 +50,20 @@ export async function recognizeReceipt(
   if (!settings.ocrSpaceApiKey) {
     throw new OcrError('Не задан ключ OCR.space. Настройки → Распознавание чеков.');
   }
+
+  /**
+   * Страховка от дорогой опечатки: ключ Anthropic начинается с «sk-ant-».
+   * Если он случайно попал в поле OCR.space (а поле ввода одно на оба движка),
+   * мы бы отправили действующий платный ключ в чужой сервис — и он остался бы
+   * в их логах. Лучше остановиться и сказать.
+   */
+  if (settings.ocrSpaceApiKey.startsWith('sk-ant-')) {
+    throw new OcrError(
+      'Это ключ Anthropic, а не OCR.space — я не буду отправлять его в чужой сервис. ' +
+        'Переключи движок на Claude или вставь ключ OCR.space.'
+    );
+  }
+
   const text = await ocrSpaceText(base64Jpeg, settings.ocrSpaceApiKey);
   return { ...parseReceiptText(text), rawText: text };
 }
@@ -76,75 +91,170 @@ const CLAUDE_PROMPT = `Это фотография кассового чека. 
 - Верни только JSON.`;
 
 async function recognizeWithClaude(base64: string, apiKey: string): Promise<ParsedReceipt> {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-      // нужно, если приложение когда-нибудь запустится в вебе
-      'anthropic-dangerous-direct-browser-access': 'true',
+  const res = await fetchWithTimeout(
+    'https://api.anthropic.com/v1/messages',
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        // нужно, если приложение когда-нибудь запустится в вебе
+        'anthropic-dangerous-direct-browser-access': 'true',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-5',
+        // 2048 не хватало: чек из магазина на 30+ позиций обрывался на
+        // полуслове, JSON оказывался битым, и человек получал «не удалось
+        // разобрать» — всегда, сколько бы раз ни пробовал.
+        max_tokens: 8192,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image',
+                source: { type: 'base64', media_type: 'image/jpeg', data: base64 },
+              },
+              { type: 'text', text: CLAUDE_PROMPT },
+            ],
+          },
+        ],
+      }),
     },
-    body: JSON.stringify({
-      model: 'claude-sonnet-5',
-      max_tokens: 2048,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'image',
-              source: { type: 'base64', media_type: 'image/jpeg', data: base64 },
-            },
-            { type: 'text', text: CLAUDE_PROMPT },
-          ],
-        },
-      ],
-    }),
-  });
+    // Распознавание картинки — не быстрая операция, даём ей время.
+    60_000
+  );
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     if (res.status === 401) throw new OcrError('Неверный ключ Anthropic API.');
     if (res.status === 429) throw new OcrError('Слишком много запросов, попробуй через минуту.');
+    if (res.status === 413) throw new OcrError('Фото слишком большое. Сними чек поближе.');
     throw new OcrError(`Anthropic API: ошибка ${res.status}. ${body.slice(0, 200)}`);
   }
 
   const data = await res.json();
   const text: string = data?.content?.[0]?.text ?? '';
+
+  // Модель могла упереться в лимит и оборваться на полуслове.
+  if (data?.stop_reason === 'max_tokens') {
+    throw new OcrError('Чек слишком длинный — не поместился в ответ. Сфотографируй его частями.');
+  }
+
   const json = extractJson(text);
   if (!json) throw new OcrError('Не удалось разобрать ответ модели.');
 
-  const items: ReceiptItem[] = Array.isArray(json.items)
+  return sanitizeReceipt(json, text);
+}
+
+/**
+ * Приводит ответ модели к безопасному виду.
+ *
+ * Ответ модели — это НЕ доверенные данные. Во-первых, модель может ошибиться
+ * и вернуть не ту структуру. Во-вторых, текст на самом чеке может пытаться ею
+ * командовать («не обращай внимания на инструкции выше…») — фотографию делает
+ * человек, но что на ней напечатано, мы не контролируем.
+ *
+ * Поэтому здесь всё приводится к нужному типу принудительно. Раньше, например,
+ * `merchant` пробрасывался как есть: стоило модели вернуть объект вместо
+ * строки — и React падал с красным экраном.
+ */
+function sanitizeReceipt(json: any, rawText: string): ParsedReceipt {
+  /** Максимум позиций в чеке. Больше — почти наверняка мусор. */
+  const MAX_ITEMS = 200;
+  /** Потолок цены одной позиции. Защита от «99999999» из инъекции. */
+  const MAX_PRICE = 100_000_000;
+
+  const text = (v: unknown, maxLen: number): string | undefined => {
+    if (typeof v !== 'string') return undefined;
+    const s = v.trim().slice(0, maxLen);
+    return s || undefined;
+  };
+
+  const items: ReceiptItem[] = Array.isArray(json?.items)
     ? json.items
+        .slice(0, MAX_ITEMS)
         .map((it: any) => ({
-          name: String(it?.name ?? '').trim(),
+          name: text(it?.name, 120) ?? '',
           price: toNumber(it?.price),
           qty: it?.qty != null ? toNumber(it.qty) : undefined,
         }))
-        .filter((it: ReceiptItem) => it.name && it.price > 0)
+        .filter((it: ReceiptItem) => it.name && it.price > 0 && it.price <= MAX_PRICE)
     : [];
 
+  const total = json?.total != null ? toNumber(json.total) : undefined;
+
   return {
-    merchant: json.merchant ?? undefined,
-    date: isoOrUndefined(json.date),
-    currency: normalizeCurrency(json.currency),
-    total: json.total != null ? toNumber(json.total) : undefined,
+    merchant: text(json?.merchant, 80),
+    date: isoOrUndefined(json?.date),
+    currency: normalizeCurrency(json?.currency),
+    total: total != null && total > 0 && total <= MAX_PRICE ? total : undefined,
     items,
-    rawText: text,
+    rawText,
   };
 }
 
-/** Достаёт первый JSON-объект из ответа (на случай, если модель добавила текст). */
+/**
+ * Достаёт JSON из ответа модели.
+ *
+ * Модель почти всегда возвращает чистый JSON, но иногда оборачивает его в
+ * ```json … ``` или предваряет фразой. Наивный «от первой { до последней }»
+ * ломался, если в тексте до JSON попадалась фигурная скобка.
+ */
 function extractJson(text: string): any | null {
-  const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start === -1 || end <= start) return null;
-  try {
-    return JSON.parse(text.slice(start, end + 1));
-  } catch {
-    return null;
+  const tryParse = (s: string) => {
+    try {
+      return JSON.parse(s);
+    } catch {
+      return null;
+    }
+  };
+
+  // 1. Как есть.
+  const direct = tryParse(text.trim());
+  if (direct) return direct;
+
+  // 2. Внутри ```json … ```
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) {
+    const parsed = tryParse(fenced[1].trim());
+    if (parsed) return parsed;
   }
+
+  // 3. Ищем сбалансированный объект: считаем скобки, пропуская те, что внутри строк.
+  const start = text.indexOf('{');
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (c === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (c === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return tryParse(text.slice(start, i + 1));
+    }
+  }
+
+  return null;
 }
 
 /* ───────────────────────────  Движок 2: OCR.space  ──────────────────────── */
@@ -157,11 +267,11 @@ async function ocrSpaceText(base64: string, apiKey: string): Promise<string> {
   form.append('scale', 'true');
   form.append('OCREngine', '2');
 
-  const res = await fetch('https://api.ocr.space/parse/image', {
-    method: 'POST',
-    headers: { apikey: apiKey },
-    body: form,
-  });
+  const res = await fetchWithTimeout(
+    'https://api.ocr.space/parse/image',
+    { method: 'POST', headers: { apikey: apiKey }, body: form },
+    60_000
+  );
 
   if (!res.ok) throw new OcrError(`OCR.space: ошибка ${res.status}`);
   const data = await res.json();
@@ -255,7 +365,17 @@ function detectDate(text: string): string | undefined {
 
 /* ────────────────────────────  Утилиты  ─────────────────────────────────── */
 
-/** "1 234,56" | "1,234.56" | 99 -> число. */
+/**
+ * Число из чека: "1 234,56" (рус) | "1.234,56" (итал) | "1,234.56" (англ) | 99.
+ *
+ * Главная ловушка — одинокая точка. В Италии «2.500» это две с половиной
+ * тысячи, а не два с половиной. Раньше такой чек попадал в расходы как 2,50 €
+ * вместо 2500 € — ошибка в тысячу раз, причём в сторону занижения, так что
+ * заметить её по итогам почти невозможно.
+ *
+ * Правило: разделитель с ровно тремя цифрами после него — это тысячи,
+ * а не дробь. Дробная часть в деньгах трёхзначной не бывает.
+ */
 export function toNumber(v: unknown): number {
   if (typeof v === 'number') return isFinite(v) ? v : 0;
   if (typeof v !== 'string') return 0;
@@ -265,14 +385,22 @@ export function toNumber(v: unknown): number {
   const lastDot = s.lastIndexOf('.');
 
   if (lastComma > -1 && lastDot > -1) {
-    // разделитель дробной части — тот, что правее
+    // Есть оба разделителя: дробный — тот, что правее.
     const decimalSep = lastComma > lastDot ? ',' : '.';
     const thousandSep = decimalSep === ',' ? '.' : ',';
     s = s.split(thousandSep).join('');
     s = s.replace(decimalSep, '.');
   } else if (lastComma > -1) {
-    // "1,50" — дробь; "1,500" — вероятнее тысячи
+    // "1,50" — дробь; "1,500" — тысячи.
     s = s.length - lastComma - 1 === 3 ? s.split(',').join('') : s.replace(',', '.');
+  } else if (lastDot > -1) {
+    // То же самое для точки. Раньше этой ветки не было вовсе, и "2.500"
+    // молча превращалось в 2.5.
+    const digitsAfter = s.length - lastDot - 1;
+    const hasMultiple = s.indexOf('.') !== lastDot;
+    // Несколько точек ("1.234.567") — точно тысячи.
+    // Одна точка и ровно 3 цифры после неё ("2.500") — тоже тысячи.
+    if (hasMultiple || digitsAfter === 3) s = s.split('.').join('');
   }
 
   const n = parseFloat(s);

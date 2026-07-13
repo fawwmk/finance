@@ -35,6 +35,7 @@ export function AddTransactionScreen({ navigation }: any) {
     transactions,
     taxProfile,
     taxSetAside,
+    taxPaid,
     setTaxAside,
     rates,
   } = useStore();
@@ -68,9 +69,15 @@ export function AddTransactionScreen({ navigation }: any) {
     () => taxYearExpenses(transactions, base, rates),
     [transactions, base, rates]
   );
-  const bonusUsed = useMemo(() => npdBonusUsed(transactions), [transactions]);
+  const bonusUsed = useMemo(
+    () => npdBonusUsed(transactions, base, rates),
+    [transactions, base, rates]
+  );
 
-  /** Сумма в базовой валюте — налоги считаются только в ней. */
+  /**
+   * Сумма в базовой валюте — налоги считаются только в ней.
+   * null — курса нет; тогда налог считать нечестно, и мы этого не делаем.
+   */
   const inBase = useMemo(
     () => convertToBase(numeric, currency, base, rates),
     [numeric, currency, base, rates]
@@ -78,16 +85,29 @@ export function AddTransactionScreen({ navigation }: any) {
 
   /** Сколько отложить с этого поступления — считаем на лету, пока вводишь сумму. */
   const reserve = useMemo(() => {
-    if (!taxProfile || kind !== 'income' || !taxable || inBase <= 0) return null;
+    if (!taxProfile || kind !== 'income' || !taxable) return null;
+    if (inBase == null || inBase <= 0) return null;
     return reserveForIncome(
       inBase,
       payerType,
       { ...taxProfile, npdBonusUsed: bonusUsed },
       ytdIncome,
       ytdExpenses,
-      taxSetAside
+      taxSetAside,
+      taxPaid
     );
-  }, [taxProfile, kind, taxable, inBase, payerType, bonusUsed, ytdIncome, ytdExpenses, taxSetAside]);
+  }, [
+    taxProfile,
+    kind,
+    taxable,
+    inBase,
+    payerType,
+    bonusUsed,
+    ytdIncome,
+    ytdExpenses,
+    taxSetAside,
+    taxPaid,
+  ]);
 
   const shiftDay = (delta: number) => {
     const d = new Date(date + 'T00:00:00');
@@ -215,11 +235,14 @@ export function AddTransactionScreen({ navigation }: any) {
           {currency !== base && numeric > 0 && (
             <Txt
               variant="caption"
-              color={palette.textMuted}
+              color={inBase == null ? palette.expense : palette.textMuted}
               style={{ textAlign: 'center', marginTop: -spacing.md, marginBottom: spacing.lg }}
             >
-              ≈ {formatMoney(inBase, base)} по курсу{' '}
-              {rates?.source === 'aiyl' ? 'Айыл Банка' : 'ЦБ РФ'}
+              {inBase == null
+                ? `Курс ${currency} → ${base} неизвестен. Операция сохранится, но в итоги не войдёт.`
+                : `≈ ${formatMoney(inBase, base)} по курсу ${
+                    rates?.source === 'aiyl' ? 'Айыл Банка' : 'ЦБ РФ'
+                  }`}
             </Txt>
           )}
 

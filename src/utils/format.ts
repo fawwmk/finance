@@ -111,3 +111,15 @@ export function daysUntil(iso: string): number {
   const now = new Date(todayISO() + 'T00:00:00').getTime();
   return Math.round((target - now) / 86_400_000);
 }
+
+/**
+ * Русское склонение по числу: plural(2, 'кредит', 'кредита', 'кредитов') → 'кредита'.
+ * Одна реализация на весь проект — раньше их было две, слегка разные.
+ */
+export function plural(n: number, one: string, few: string, many: string): string {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return one;
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return few;
+  return many;
+}

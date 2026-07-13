@@ -8,7 +8,7 @@ import { useStore } from '../store/useStore';
 import { bankById } from '../data/banks';
 import { buildSchedule, loanProgress, cardStatus, formatTerm } from '../utils/loan';
 import { convertToBase } from '../store/selectors';
-import { formatMoney, formatDate, todayISO } from '../utils/format';
+import { formatMoney, formatDate, todayISO, plural } from '../utils/format';
 import { Loan } from '../types';
 
 export function LoansScreen({ navigation }: any) {
@@ -44,15 +44,29 @@ export function LoansScreen({ navigation }: any) {
   const totals = useMemo(() => {
     let debt = 0;
     let monthly = 0;
+    // Кредит в валюте без курса в общий итог не суммируем — иначе доллары
+    // сложатся с рублями как один к одному. Считаем такие отдельно.
+    let skipped = 0;
 
     for (const { loan, calc, prog } of creditView) {
-      debt += convertToBase(prog.remainingDebt, loan.currency, base, rates);
-      if (prog.next) monthly += convertToBase(calc.monthlyPayment, loan.currency, base, rates);
+      const d = convertToBase(prog.remainingDebt, loan.currency, base, rates);
+      const m = convertToBase(calc.monthlyPayment, loan.currency, base, rates);
+      if (d == null || (prog.next && m == null)) {
+        skipped += 1;
+        continue;
+      }
+      debt += d;
+      if (prog.next && m != null) monthly += m;
     }
     for (const { loan, status } of cardView) {
-      debt += convertToBase(status.debt, loan.currency, base, rates);
+      const d = convertToBase(status.debt, loan.currency, base, rates);
+      if (d == null) {
+        skipped += 1;
+        continue;
+      }
+      debt += d;
     }
-    return { debt, monthly };
+    return { debt, monthly, skipped };
   }, [creditView, cardView, base, rates]);
 
   const empty = loans.length === 0;
@@ -119,6 +133,12 @@ export function LoansScreen({ navigation }: any) {
                     </Txt>
                   </View>
                 </>
+              )}
+              {totals.skipped > 0 && (
+                <Txt variant="caption" color={palette.expense} style={{ marginTop: spacing.sm }}>
+                  {plural(totals.skipped, 'кредит', 'кредита', 'кредитов')} в валюте без курса — в
+                  сумму не вошли.
+                </Txt>
               )}
             </Card>
 

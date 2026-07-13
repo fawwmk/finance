@@ -165,9 +165,19 @@ export function employeeContributions(profile: TaxProfile, months: number) {
 export function ipContributions(
   yearIncome: number,
   profile?: TaxProfile,
-  months = 12
+  months = 12,
+  /**
+   * База для дополнительного 1%. По умолчанию — весь доход, и для УСН «Доходы»
+   * это верно. Но НЕ для всех режимов:
+   *   • УСН «Доходы минус расходы» и ОСНО — 1% берётся с ПРИБЫЛИ, а не с выручки.
+   *     Раньше здесь была выручка, и при обороте 5 млн с расходами 4,8 млн
+   *     приложение просило отложить лишние 47 000 ₽.
+   *   • Патент — с ПОТЕНЦИАЛЬНОГО дохода, который определил регион,
+   *     а не с того, что ты реально заработал.
+   */
+  extraBase: number = yearIncome
 ): Contributions {
-  const over = Math.max(0, yearIncome - IP_CONTRIBUTIONS.extraThreshold);
+  const over = Math.max(0, extraBase - IP_CONTRIBUTIONS.extraThreshold);
   const extra = Math.min(over * IP_CONTRIBUTIONS.extraRate, IP_CONTRIBUTIONS.extraCap);
 
   const voluntary = profile?.voluntarySfr ? voluntarySfrAmount() : 0;
@@ -197,12 +207,41 @@ export interface TaxBurden {
   contributions: Contributions;
   /** На сколько взносы срезали налог. */
   reducedBy: number;
+  /** НДС на УСН — появляется после превышения порога. 0, если не плательщик. */
+  vat: number;
   /** Всё вместе — вот это и есть «сколько стоит год». */
   total: number;
   /** Эффективная ставка от дохода. */
   effectiveRate: number;
   /** Что стоит знать: превышения лимитов, НДС и т.п. */
   warnings: string[];
+}
+
+/**
+ * НДС на УСН.
+ *
+ * Пока доход не перевалил порог (20 млн) — НДС нет вовсе. Как только перевалил,
+ * с 1-го числа следующего месяца ИП становится плательщиком НДС. Ставку можно
+ * выбрать: пониженную без права на вычеты (5% до 250 млн, 7% до 450 млн) или
+ * общую 22% с вычетами. Малому бизнесу почти всегда выгоднее пониженная, её
+ * и считаем.
+ *
+ * Считаем НДС с дохода СВЕРХ порога — это приближение (по закону обязанность
+ * возникает с начала следующего месяца), но оно честнее, чем прежнее «никак».
+ * Раньше приложение при доходе 25 млн говорило «откладывать нечего», хотя
+ * человек был должен больше миллиона.
+ */
+function usnVat(income: number): { vat: number; rate: number } {
+  if (income <= USN.vatThreshold) return { vat: 0, rate: 0 };
+
+  const rate =
+    income <= USN.vatLowLimit
+      ? USN.vatRateLow
+      : income <= USN.vatMidLimit
+        ? USN.vatRateMid
+        : USN.vatRateBase;
+
+  return { vat: Math.max(0, income - USN.vatThreshold) * rate, rate };
 }
 
 /**
@@ -240,6 +279,7 @@ export function annualBurden(
       taxPayable: 0, // с тебя уже удержали
       contributions: zeroContributions,
       reducedBy: 0,
+      vat: 0,
       total: 0,
       effectiveRate: 0,
       warnings: profile.resident
@@ -274,6 +314,7 @@ export function annualBurden(
       taxPayable: tax,
       contributions: zeroContributions,
       reducedBy: 0,
+      vat: 0,
       total: tax,
       effectiveRate: income > 0 ? tax / income : 0,
       warnings,
@@ -282,16 +323,43 @@ export function annualBurden(
 
   /* — Самозанятый — */
   if (status === 'npd') {
-    // Для годовой оценки считаем по фактической смеси плательщиков — она
-    // приходит уже посчитанной в income/…; здесь берём консервативно 6%.
-    const bonusLeft = Math.max(0, NPD.bonusTotal - (profile.npdBonusUsed ?? 0));
-    const r = npdTax(income, 'company', bonusLeft);
+    /**
+     * Бонус берём ПОЛНЫЙ (10 000 ₽), а не «сколько осталось».
+     *
+     * Здесь считается налог за весь год с нуля — значит, и бонус применяется
+     * к этому же расчёту целиком. Раньше сюда подставлялся остаток бонуса,
+     * и уже потраченная часть терялась: год выходил дороже ровно на неё,
+     * до 10 000 ₽. Из-за этого самозанятость выглядела невыгоднее, чем есть.
+     */
+    const withinLimit = Math.min(income, NPD.incomeLimit);
+    const r = npdTax(withinLimit, 'company', NPD.bonusTotal);
 
+    /**
+     * Лимит пробит: с превышения НПД уже не платится. Доход сверх лимита —
+     * обычный доход физлица, с него НДФЛ, и статус самозанятого утрачен.
+     */
     if (income > NPD.incomeLimit) {
+      const excess = income - NPD.incomeLimit;
+      const excessTax = ndfl(excess, profile.resident);
+      const total = r.tax + excessTax;
+
       warnings.push(
-        `Превышен лимит НПД (${fmt(NPD.incomeLimit)} ₽). Право на самозанятость теряется — нужно открывать ИП.`
+        `Превышен лимит НПД (${fmt(NPD.incomeLimit)} ₽). Статус самозанятого утрачен с момента превышения: ${fmt(excess)} ₽ сверх лимита облагаются уже НДФЛ (${fmt(excessTax)} ₽), а не 6%. Нужно срочно регистрировать ИП — на УСН вышло бы дешевле.`
       );
-    } else if (income > NPD.incomeLimit * 0.8) {
+
+      return {
+        taxGross: total,
+        taxPayable: total,
+        contributions: zeroContributions,
+        reducedBy: 0,
+        vat: 0,
+        total,
+        effectiveRate: income > 0 ? total / income : 0,
+        warnings,
+      };
+    }
+
+    if (income > NPD.incomeLimit * 0.8) {
       warnings.push(
         `Осталось ${fmt(NPD.incomeLimit - income)} ₽ до лимита НПД. Дальше — только ИП.`
       );
@@ -302,6 +370,7 @@ export function annualBurden(
       taxPayable: r.tax,
       contributions: zeroContributions,
       reducedBy: 0,
+      vat: 0,
       total: r.tax,
       effectiveRate: income > 0 ? r.tax / income : 0,
       warnings,
@@ -309,7 +378,26 @@ export function annualBurden(
   }
 
   /* — Дальше всё ИП: сначала взносы — */
-  const contributions = ipContributions(income, profile, monthsElapsed);
+
+  /**
+   * База для дополнительного 1% взносов зависит от режима — это не мелочь,
+   * разница легко достигает десятков тысяч рублей за год.
+   */
+  const extraBase = (() => {
+    if (status === 'ip_usn_profit' || status === 'ip_osno') {
+      // С прибыли, а не с оборота.
+      return Math.max(0, income - expenses);
+    }
+    if (status === 'ip_psn') {
+      // С потенциального дохода, назначенного регионом. Обратно из стоимости
+      // патента: патент = потенциальный доход × 6%.
+      const patent = profile.patentCost ?? 0;
+      return PSN.rate > 0 ? patent / PSN.rate : 0;
+    }
+    return income;
+  })();
+
+  const contributions = ipContributions(income, profile, monthsElapsed, extraBase);
   const withEmployees = profile.hasEmployees === true;
 
   if (withEmployees && !profile.payrollMonthly) {
@@ -343,21 +431,23 @@ export function annualBurden(
     const taxGross = income * rate;
     const { payable, reducedBy } = applyReduction(taxGross);
 
-    if (income > USN.vatThreshold) {
+    const { vat, rate: vatRate } = usnVat(income);
+    if (vat > 0) {
       warnings.push(
-        `Доход выше ${fmt(USN.vatThreshold)} ₽ — ИП на УСН становится плательщиком НДС. Порог менялся, сверься с ФНС.`
+        `Доход выше ${fmt(USN.vatThreshold)} ₽ — ты плательщик НДС. Заложено ${fmt(vat)} ₽ по пониженной ставке ${pct(vatRate)} (без права на вычеты). Можно выбрать общую ставку 22% с вычетами — если у тебя много закупок с НДС, это может выйти дешевле. Обсуди с бухгалтером.`
       );
     }
     if (income > usnIncomeLimit()) {
       warnings.push(`Превышен лимит УСН (${fmt(usnIncomeLimit())} ₽ с учётом дефлятора) — слетаешь на ОСНО.`);
     }
 
-    const total = payable + contributions.total;
+    const total = payable + contributions.total + vat;
     return {
       taxGross,
       taxPayable: payable,
       contributions,
       reducedBy,
+      vat,
       total,
       effectiveRate: income > 0 ? total / income : 0,
       warnings,
@@ -377,18 +467,24 @@ export function annualBurden(
         `Расходы съели прибыль — платишь минимальный налог 1% с дохода (${fmt(minTax)} ₽).`
       );
     }
-    if (income > USN.vatThreshold) {
+
+    const { vat, rate: vatRate } = usnVat(income);
+    if (vat > 0) {
       warnings.push(
-        `Доход выше ${fmt(USN.vatThreshold)} ₽ — появляется НДС. Порог менялся, сверься с ФНС.`
+        `Доход выше ${fmt(USN.vatThreshold)} ₽ — ты плательщик НДС. Заложено ${fmt(vat)} ₽ по ставке ${pct(vatRate)}.`
       );
     }
+    if (income > usnIncomeLimit()) {
+      warnings.push(`Превышен лимит УСН (${fmt(usnIncomeLimit())} ₽ с учётом дефлятора) — слетаешь на ОСНО.`);
+    }
 
-    const total = payable + contributions.total;
+    const total = payable + contributions.total + vat;
     return {
       taxGross: regular,
       taxPayable: payable,
       contributions,
       reducedBy: 0,
+      vat,
       total,
       effectiveRate: income > 0 ? total / income : 0,
       warnings,
@@ -397,6 +493,38 @@ export function annualBurden(
 
   if (status === 'ip_psn') {
     const patent = profile.patentCost ?? 0;
+
+    /**
+     * Лимит патента пробит — патент аннулируется ЗАДНИМ ЧИСЛОМ, с начала его
+     * действия, и весь доход пересчитывают по УСН (или ОСНО, если на УСН не
+     * переходил). Стоимость патента при этом зачтут.
+     *
+     * Раньше приложение продолжало считать по патенту и просто печатало
+     * предупреждение — то есть занижало долг в разы. Теперь считаем по-честному.
+     */
+    if (income > PSN.incomeLimit) {
+      const usnRate = (profile.usnRatePercent ?? USN.incomeRate * 100) / 100;
+      const taxGross = income * usnRate;
+      const { payable, reducedBy } = applyReduction(taxGross);
+      const { vat } = usnVat(income);
+
+      warnings.push(
+        `Превышен лимит патента (${fmt(PSN.incomeLimit)} ₽). Патент аннулируется с начала его действия, и весь доход пересчитывается по УСН — я уже считаю так. Уплаченную стоимость патента (${fmt(patent)} ₽) зачтут; это здесь не учтено, поэтому оценка с запасом.`
+      );
+
+      const total = payable + contributions.total + vat;
+      return {
+        taxGross,
+        taxPayable: payable,
+        contributions,
+        reducedBy,
+        vat,
+        total,
+        effectiveRate: income > 0 ? total / income : 0,
+        warnings,
+      };
+    }
+
     const { payable, reducedBy } = applyReduction(patent);
 
     if (!patent) {
@@ -404,9 +532,9 @@ export function annualBurden(
         'Укажи стоимость патента — её считает регион под твой вид деятельности. Точная цифра: patent.nalog.ru.'
       );
     }
-    if (income > PSN.incomeLimit) {
+    if (income > PSN.incomeLimit * 0.8) {
       warnings.push(
-        `Превышен лимит патента (${fmt(PSN.incomeLimit)} ₽) — пересчитают по УСН или ОСНО с начала действия патента.`
+        `Осталось ${fmt(PSN.incomeLimit - income)} ₽ до лимита патента (${fmt(PSN.incomeLimit)} ₽). Превысишь — пересчитают по УСН с начала года.`
       );
     }
 
@@ -416,6 +544,7 @@ export function annualBurden(
       taxPayable: payable,
       contributions,
       reducedBy,
+      vat: 0,
       total,
       effectiveRate: income > 0 ? total / income : 0,
       warnings,
@@ -438,6 +567,9 @@ export function annualBurden(
     taxPayable: tax,
     contributions,
     reducedBy: 0,
+    // НДС на ОСНО есть всегда, но его размер зависит от вычетов по закупкам,
+    // а их приложение не знает. Считать наугад хуже, чем честно сказать «не знаю».
+    vat: 0,
     total,
     effectiveRate: income > 0 ? total / income : 0,
     warnings,
@@ -469,6 +601,9 @@ export interface Reserve {
  *
  * @param ytdIncomeBefore доход с начала года ДО этого поступления
  * @param alreadySetAside сколько уже лежит в налоговой копилке
+ * @param alreadyPaid сколько уже УПЛАЧЕНО в бюджет с начала года (авансы).
+ *   Без этого числа модель ломалась: заплатил аванс, копилка обнулилась —
+ *   и приложение снова требовало отложить налог с уже оплаченного дохода.
  */
 export function reserveForIncome(
   amount: number,
@@ -477,9 +612,13 @@ export function reserveForIncome(
   ytdIncomeBefore: number,
   ytdExpenses = 0,
   alreadySetAside = 0,
+  alreadyPaid = 0,
   monthsElapsed: number = new Date().getMonth() + 1
 ): Reserve {
   if (amount <= 0) return { amount: 0, rate: 0, explanation: '' };
+
+  /** Уже закрытая часть долга: и то, что отложено, и то, что уплачено. */
+  const covered = alreadySetAside + alreadyPaid;
 
   if (profile.status === 'employee') {
     return {
@@ -497,7 +636,7 @@ export function reserveForIncome(
    */
   if (profile.status === 'unofficial') {
     const needed = ndfl(ytdIncomeBefore + amount, profile.resident);
-    const gap = Math.max(0, needed - alreadySetAside);
+    const gap = Math.max(0, needed - covered);
     const suggest = Math.min(amount, gap);
 
     return {
@@ -511,6 +650,28 @@ export function reserveForIncome(
 
   /* — Самозанятый: взносов нет, налог считается ровно с поступления — */
   if (profile.status === 'npd') {
+    /**
+     * Лимит пробит — это уже не самозанятость. Считаем накопительно, как у ИП:
+     * иначе приложение продолжало бы бодро предлагать «отложи 6%», хотя с
+     * превышения платится НДФЛ 13%, и человек ушёл бы в минус перед налоговой.
+     */
+    if (ytdIncomeBefore + amount > NPD.incomeLimit) {
+      const needed = annualBurden(
+        profile,
+        ytdIncomeBefore + amount,
+        ytdExpenses,
+        monthsElapsed
+      ).total;
+      const gap = Math.max(0, needed - covered);
+      const suggest = Math.min(amount, gap);
+
+      return {
+        amount: suggest,
+        rate: suggest / amount,
+        explanation: `Годовой лимит НПД (${fmt(NPD.incomeLimit)} ₽) превышен. Доход сверх лимита облагается НДФЛ, а не 6%, — откладывать нужно больше. Статус самозанятого утрачен: срочно к бухгалтеру, нужно открывать ИП.`,
+      };
+    }
+
     const bonusLeft = Math.max(0, NPD.bonusTotal - (profile.npdBonusUsed ?? 0));
     const r = npdTax(amount, payer, bonusLeft);
 
@@ -529,13 +690,15 @@ export function reserveForIncome(
     ytdExpenses,
     monthsElapsed
   ).total;
-  const gap = Math.max(0, needed - alreadySetAside);
+  const gap = Math.max(0, needed - covered);
   // Больше, чем пришло, отложить всё равно невозможно.
   const suggest = Math.min(amount, gap);
 
   const crossed =
     ytdIncomeBefore < IP_CONTRIBUTIONS.extraThreshold &&
     ytdIncomeBefore + amount > IP_CONTRIBUTIONS.extraThreshold;
+
+  const paidNote = alreadyPaid > 0 ? `, уплачено ${fmt(alreadyPaid)} ₽` : '';
 
   let explanation: string;
   if (suggest === 0) {
@@ -545,7 +708,7 @@ export function reserveForIncome(
   } else if (crossed) {
     explanation = `Доход перевалил за ${fmt(IP_CONTRIBUTIONS.extraThreshold)} ₽ — включился дополнительный 1% взносов.`;
   } else {
-    explanation = `Всего должен на сегодня ${fmt(needed)} ₽, отложено ${fmt(alreadySetAside)} ₽. Сюда входят фиксированные взносы ${fmt(IP_CONTRIBUTIONS.fixed)} ₽ — они платятся до 28 декабря, даже если дохода больше не будет.`;
+    explanation = `Всего должен за год ${fmt(needed)} ₽: отложено ${fmt(alreadySetAside)} ₽${paidNote}. Сюда входят фиксированные взносы ${fmt(IP_CONTRIBUTIONS.fixed)} ₽ — они платятся до 28 декабря, даже если дохода больше не будет.`;
   }
 
   return { amount: suggest, rate: suggest / amount, explanation };

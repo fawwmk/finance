@@ -123,7 +123,9 @@ function useReminders(hydrated: boolean) {
 
   useEffect(() => {
     if (!hydrated) return;
-    syncReminders(recurring, settings);
+    // Пересборка очереди уведомлений — сетевая по своей природе операция:
+    // упасть она может, но ронять из-за этого приложение незачем.
+    syncReminders(recurring, settings).catch(() => {});
   }, [hydrated, recurring, settings.notificationsEnabled, settings.baseCurrency]);
 
   useEffect(() => {
@@ -149,16 +151,26 @@ function useTaxRates() {
   useEffect(() => {
     loadCachedTaxConfig().finally(() => {
       setReady(true);
-      refreshTaxConfig();
+      // Обновление ставок — в фоне: оно не должно задерживать запуск.
+      refreshTaxConfig().catch(() => {});
     });
   }, []);
 
   return ready;
 }
 
+/** Ключи API лежат в Keychain — поднимаем их в память один раз при старте. */
+function useSecrets() {
+  const loadSecrets = useStore((s) => s.loadSecrets);
+  useEffect(() => {
+    loadSecrets().catch(() => {});
+  }, []);
+}
+
 export default function App() {
   const hydrated = useStore((s) => s.hydrated);
   const ratesReady = useTaxRates();
+  useSecrets();
   useReminders(hydrated);
 
   const ready = hydrated && ratesReady;

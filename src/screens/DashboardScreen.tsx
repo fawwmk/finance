@@ -8,22 +8,44 @@ import { palette, spacing, radius } from '../theme/theme';
 import { useStore } from '../store/useStore';
 import { categoryById } from '../data/categories';
 import {
-  currentBalance,
+  walletBalances,
+  nonEmptyWallets,
+  totalInBase,
+  convertToBase,
   monthTotals,
   dailyBudget,
   upcoming,
+  feedByDay,
 } from '../store/selectors';
-import { formatMoney, relativeDay, daysUntil, formatDate } from '../utils/format';
+import {
+  formatMoney,
+  relativeDay,
+  daysUntil,
+  formatDate,
+  CURRENCY_SYMBOL,
+} from '../utils/format';
 
 export function DashboardScreen({ navigation }: any) {
-  const { transactions, recurring, categories, settings, rates, taxSetAside, taxProfile } =
+  const { transactions, recurring, exchanges, categories, settings, rates, taxSetAside, taxProfile } =
     useStore();
   const base = settings.baseCurrency;
 
-  const balance = useMemo(
-    () => currentBalance(transactions, base, rates),
-    [transactions, base, rates]
+  /**
+   * Деньги по кошелькам: сколько лежит в рублях, сколько в евро, сколько в
+   * долларах. Обмены здесь учтены — они перекладывают деньги между кошельками.
+   */
+  const wallets = useMemo(
+    () => walletBalances(transactions, exchanges),
+    [transactions, exchanges]
   );
+  const walletList = useMemo(() => nonEmptyWallets(wallets), [wallets]);
+
+  /** Всё вместе, в базовой валюте. missing — валюты, курс которых неизвестен. */
+  const { total: balance, missing } = useMemo(
+    () => totalInBase(wallets, base, rates),
+    [wallets, base, rates]
+  );
+
   const month = useMemo(
     () => monthTotals(transactions, base, rates),
     [transactions, base, rates]
@@ -37,7 +59,14 @@ export function DashboardScreen({ navigation }: any) {
     [spendable, recurring, base, rates]
   );
   const soon = useMemo(() => upcoming(recurring, 45), [recurring]);
-  const recent = transactions.slice(0, 5);
+  /** Последние события: и операции, и обмены — иначе непонятно, откуда евро. */
+  const recent = useMemo(
+    () =>
+      feedByDay(transactions, exchanges)
+        .flatMap((g) => g.items)
+        .slice(0, 5),
+    [transactions, exchanges]
+  );
 
   return (
     <Screen>
@@ -60,6 +89,69 @@ export function DashboardScreen({ navigation }: any) {
             из них {formatMoney(taxSetAside, base)} отложено на налоги — свободно{' '}
             {formatMoney(spendable, base)}
           </Txt>
+        )}
+
+        {missing.length > 0 && (
+          <Txt variant="caption" color={palette.expense} style={{ marginTop: 4 }}>
+            Курс {missing.join(', ')} неизвестен — эти деньги в общую сумму не вошли. Обнови курсы.
+          </Txt>
+        )}
+
+        {/*
+          Кошельки по валютам.
+          Главное, чего не видно в «общем балансе»: заработок в рублях, а платить
+          надо евро. Общая сумма может быть большой, а евро при этом — ноль.
+        */}
+        {walletList.length > 1 && (
+          <Card style={{ marginTop: spacing.lg }}>
+            <View style={styles.walletHeader}>
+              <Txt variant="caption" color={palette.textMuted} weight="semibold">
+                ГДЕ ЛЕЖАТ ДЕНЬГИ
+              </Txt>
+              <Touchable onPress={() => navigation.navigate('Exchange')}>
+                <Txt variant="caption" color={palette.accent} weight="semibold">
+                  Обменять →
+                </Txt>
+              </Touchable>
+            </View>
+
+            {walletList.map(({ code, amount }) => {
+              const inBase = convertToBase(amount, code, base, rates);
+              const negative = amount < 0;
+
+              return (
+                <View key={code} style={styles.walletRow}>
+                  <View style={styles.walletBadge}>
+                    <Txt variant="caption" weight="bold" color={palette.textMuted}>
+                      {CURRENCY_SYMBOL[code]}
+                    </Txt>
+                  </View>
+
+                  <Txt
+                    variant="body"
+                    weight="semibold"
+                    color={negative ? palette.expense : palette.text}
+                    style={{ flex: 1 }}
+                  >
+                    {formatMoney(amount, code)}
+                  </Txt>
+
+                  {code !== base && (
+                    <Txt variant="caption" color={palette.textFaint}>
+                      {inBase == null ? 'курс неизвестен' : `≈ ${formatMoney(inBase, base)}`}
+                    </Txt>
+                  )}
+                </View>
+              );
+            })}
+
+            {walletList.some((w) => w.amount < 0) && (
+              <Txt variant="caption" color={palette.expense} style={{ marginTop: spacing.sm }}>
+                Минус означает, что ты потратил валюты больше, чем её было. Скорее всего, забыл
+                записать обмен.
+              </Txt>
+            )}
+          </Card>
         )}
 
         {/* Быстрые действия */}
@@ -213,7 +305,36 @@ export function DashboardScreen({ navigation }: any) {
             </Txt>
           </Card>
         ) : (
-          recent.map((t) => {
+          recent.map((entry) => {
+            /* Обмен валюты — отдельная строка: видно, откуда взялись евро. */
+            if (entry.kind === 'exchange') {
+              const ex = entry.ex;
+              return (
+                <Card key={`ex-${ex.id}`} style={styles.itemCard}>
+                  <View style={styles.exchangeIcon}>
+                    <Ionicons name="swap-horizontal" size={18} color={palette.accent} />
+                  </View>
+                  <View style={{ flex: 1, marginLeft: spacing.md }}>
+                    <Txt variant="body" weight="semibold">
+                      Обмен {ex.fromCurrency} → {ex.toCurrency}
+                    </Txt>
+                    <Txt variant="caption" color={palette.textMuted}>
+                      {relativeDay(ex.date)}
+                    </Txt>
+                  </View>
+                  <View style={{ alignItems: 'flex-end' }}>
+                    <Txt variant="caption" weight="semibold" color={palette.expense}>
+                      −{formatMoney(ex.fromAmount, ex.fromCurrency)}
+                    </Txt>
+                    <Txt variant="caption" weight="semibold" color={palette.income}>
+                      +{formatMoney(ex.toAmount, ex.toCurrency)}
+                    </Txt>
+                  </View>
+                </Card>
+              );
+            }
+
+            const t = entry.tx;
             const cat = categoryById(t.categoryId, categories);
             return (
               <Card key={t.id} style={styles.itemCard}>
@@ -250,6 +371,33 @@ export function DashboardScreen({ navigation }: any) {
 const styles = StyleSheet.create({
   row: { flexDirection: 'row', gap: spacing.md, marginTop: spacing.lg },
   half: { flex: 1 },
+  walletHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  walletRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+    marginTop: spacing.md,
+  },
+  walletBadge: {
+    width: 30,
+    height: 30,
+    borderRadius: radius.pill,
+    backgroundColor: palette.surfaceElevated,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  exchangeIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: radius.pill,
+    backgroundColor: palette.accentSoft,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   actions: { flexDirection: 'row', gap: spacing.md, marginTop: spacing.lg },
   action: {
     flex: 1,

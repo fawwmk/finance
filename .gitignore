@@ -31,7 +31,11 @@ yarn-error.*
 *.pem
 
 # local env files
-.env*.local
+# Репозиторий публичный. Игнорируем .env целиком, а не только *.local:
+# один забытый файл с ключом — и он виден всему интернету навсегда.
+.env
+.env.*
+!.env.example
 
 # typescript
 *.tsbuildinfo

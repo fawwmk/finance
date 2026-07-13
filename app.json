@@ -1,15 +1,18 @@
 {
   "expo": {
-    "name": "finance",
+    "name": "Финансы",
     "slug": "finance",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "scheme": "finance",
+    "userInterfaceStyle": "dark",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.fawwmk.finance"
     },
     "android": {
+      "package": "com.fawwmk.finance",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -27,10 +30,13 @@
         "expo-image-picker",
         {
           "photosPermission": "Нужен доступ к фото, чтобы распознать чек из галереи.",
-          "cameraPermission": "Нужен доступ к камере, чтобы сфотографировать чек."
+          "cameraPermission": "Нужен доступ к камере, чтобы сфотографировать чек.",
+          "microphonePermission": false
         }
       ],
-      "expo-notifications"
+      "expo-notifications",
+      "expo-secure-store",
+      "expo-font"
     ]
   }
 }

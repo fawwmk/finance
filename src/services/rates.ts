@@ -12,6 +12,7 @@
 
 import { CashMode, CurrencyCode, ExchangeRates, RateSource } from '../types';
 import { fetchAiylRates } from './aiyl';
+import { fetchWithTimeout } from '../utils/http';
 
 const CBR_URL = 'https://www.cbr-xml-daily.ru/daily_json.js';
 
@@ -41,9 +42,16 @@ function rubPerUnit(data: CbrResponse, code: CurrencyCode, prev = false): number
 
 /** Официальные курсы ЦБ РФ, пересчитанные в базовую валюту пользователя. */
 export async function fetchCbrRates(base: CurrencyCode): Promise<ExchangeRates> {
-  const res = await fetch(CBR_URL);
+  const res = await fetchWithTimeout(CBR_URL, {}, 10_000);
   if (!res.ok) throw new Error(`ЦБ РФ ответил ${res.status}`);
   const data: CbrResponse = await res.json();
+
+  // Вместо JSON мог прийти HTML со страницей ошибки — тогда Valute нет.
+  // Молча вернуть пустые курсы нельзя: без курсов суммы в валюте пропадут
+  // из итогов, и человек не поймёт почему. Пусть лучше будет честная ошибка.
+  if (!data?.Valute || typeof data.Valute !== 'object') {
+    throw new Error('ЦБ РФ вернул неожиданный ответ');
+  }
 
   const build = (prev: boolean) => {
     const rubPerBase = rubPerUnit(data, base, prev);
@@ -83,7 +91,10 @@ export async function fetchRates(
       return await fetchAiylRates(base, cashMode);
     } catch {
       // Сайт банка недоступен или переделали вёрстку — не оставаться же без курсов.
-      return fetchCbrRates(base);
+      // Помечаем, что просили банк: иначе приложение сочтёт эти курсы «чужими»
+      // и будет ломиться в сеть при каждом открытии экрана.
+      const cbr = await fetchCbrRates(base);
+      return { ...cbr, requestedSource: 'aiyl', requestedCashMode: cashMode };
     }
   }
   return fetchCbrRates(base);
@@ -98,7 +109,12 @@ export function isStale(
 ): boolean {
   if (!r) return true;
   if (base && r.base !== base) return true;
-  if (source && r.source !== source) return true;
-  if (source === 'aiyl' && cashMode && r.cashMode !== cashMode) return true;
+
+  // Сравниваем с тем, что ПРОСИЛИ, а не с тем, что в итоге получили.
+  const asked = r.requestedSource ?? r.source;
+  const askedCash = r.requestedCashMode ?? r.cashMode;
+  if (source && asked !== source) return true;
+  if (source === 'aiyl' && cashMode && askedCash !== cashMode) return true;
+
   return Date.now() - r.fetchedAt > 6 * 60 * 60 * 1000;
 }

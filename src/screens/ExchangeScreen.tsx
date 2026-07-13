@@ -14,6 +14,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { Screen, Card, Txt, Button, Touchable } from '../components/ui';
 import { palette, spacing, radius, font } from '../theme/theme';
 import { useStore } from '../store/useStore';
+import { walletBalances } from '../store/selectors';
 import { CurrencyCode } from '../types';
 import {
   CURRENCY_SYMBOL,
@@ -32,7 +33,7 @@ import {
  * Из них считается настоящий курс сделки.
  */
 export function ExchangeScreen({ navigation }: any) {
-  const { exchanges, addExchange, deleteExchange, settings, rates } = useStore();
+  const { exchanges, addExchange, deleteExchange, transactions, settings, rates } = useStore();
 
   const [fromCurrency, setFromCurrency] = useState<CurrencyCode>(settings.baseCurrency);
   const [toCurrency, setToCurrency] = useState<CurrencyCode>('EUR');
@@ -43,6 +44,20 @@ export function ExchangeScreen({ navigation }: any) {
   const num = (s: string) => parseFloat(s.replace(',', '.')) || 0;
   const from = num(fromAmount);
   const to = num(toAmount);
+
+  /**
+   * Что лежит в кошельках сейчас — и что там окажется после обмена.
+   * Обмен не создаёт денег: он перекладывает их из одной валюты в другую.
+   */
+  const wallets = useMemo(
+    () => walletBalances(transactions, exchanges),
+    [transactions, exchanges]
+  );
+  const haveFrom = wallets[fromCurrency] ?? 0;
+  const haveTo = wallets[toCurrency] ?? 0;
+
+  /** Не хватает того, что собираешься менять. Не запрещаем — предупреждаем. */
+  const notEnough = from > 0 && from > haveFrom;
 
   /** Фактический курс сделки: сколько отдал за одну единицу полученной валюты. */
   const actualRate = to > 0 ? from / to : 0;
@@ -115,7 +130,60 @@ export function ExchangeScreen({ navigation }: any) {
           <Txt variant="body" color={palette.textMuted}>
             Впиши, сколько отдал и сколько получил на руки. Настоящий курс сделки посчитаю
             сам — со всеми спредами и комиссиями, которые в опубликованный курс не входят.
+            Деньги переедут из одного кошелька в другой.
           </Txt>
+
+          {/*
+            Что станет с кошельками. Обмен — это перекладывание: из одной валюты
+            ушло, в другой прибавилось. Показываем обе стороны сразу, чтобы было
+            видно, хватает ли того, что меняешь, и сколько получится в итоге.
+          */}
+          {(from > 0 || to > 0) && (
+            <Card style={{ marginTop: spacing.lg }}>
+              <Txt variant="caption" color={palette.textMuted} weight="semibold">
+                СТАНЕТ В КОШЕЛЬКАХ
+              </Txt>
+
+              <View style={[styles.between, { marginTop: spacing.md }]}>
+                <Txt variant="body" color={palette.textMuted}>
+                  {fromCurrency}
+                </Txt>
+                <Txt variant="body">
+                  <Txt variant="body" color={palette.textFaint}>
+                    {formatMoney(haveFrom, fromCurrency)} →{' '}
+                  </Txt>
+                  <Txt
+                    variant="body"
+                    weight="semibold"
+                    color={haveFrom - from < 0 ? palette.expense : palette.text}
+                  >
+                    {formatMoney(haveFrom - from, fromCurrency)}
+                  </Txt>
+                </Txt>
+              </View>
+
+              <View style={[styles.between, { marginTop: 6 }]}>
+                <Txt variant="body" color={palette.textMuted}>
+                  {toCurrency}
+                </Txt>
+                <Txt variant="body">
+                  <Txt variant="body" color={palette.textFaint}>
+                    {formatMoney(haveTo, toCurrency)} →{' '}
+                  </Txt>
+                  <Txt variant="body" weight="semibold" color={palette.income}>
+                    {formatMoney(haveTo + to, toCurrency)}
+                  </Txt>
+                </Txt>
+              </View>
+
+              {notEnough && (
+                <Txt variant="caption" color={palette.expense} style={{ marginTop: spacing.sm }}>
+                  В кошельке {fromCurrency} лежит только {formatMoney(haveFrom, fromCurrency)}.
+                  Запись сохраню, но кошелёк уйдёт в минус — проверь, всё ли внесено.
+                </Txt>
+              )}
+            </Card>
+          )}
 
           {/* Отдал */}
           <Label>Отдал</Label>
